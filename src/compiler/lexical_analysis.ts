@@ -1,6 +1,6 @@
 // deno-lint-ignore-file no-control-regex
 
-import { encodeBase64Url } from "@std/encoding/base64url";
+import { encodeBase64Url } from "@std/encoding";
 import { resolve, toFileUrl } from "@std/path";
 
 export class Cursor {
@@ -51,10 +51,10 @@ export class Token {
     }
 }
 
-export function resolveSource(source: string | URL): URL;
-export function resolveSource(source: `${'/' | './'}${string}`): URL;
-export function resolveSource(source: `${"file" | "http" | "https"}://${string}` | URL): URL;
-export function resolveSource(source: string | URL) {
+export function resolveSourceUrl(source: string | URL): URL;
+export function resolveSourceUrl(source: `${'/' | './'}${string}`): URL;
+export function resolveSourceUrl(source: `${"file" | "http" | "https"}://${string}` | URL): URL;
+export function resolveSourceUrl(source: string | URL) {
     return (
         source instanceof URL
             ? source
@@ -70,13 +70,13 @@ export function resolveSource(source: string | URL) {
     )
 }
 
-export type TokenDecoderOptions = {
-    sourceUrl: URL,
-    stream?: boolean,
-};
+export async function* tokenize(sourceUrl: URL) {
+    const sourceCode = await (
+        fetch(sourceUrl)
+            .then(response => response.text())
+    );
 
-export class TokenDecoder {
-    static #defaultRegExps: [ TokenType, RegExp ][] = [
+    const defaultRegExps: [ TokenType, RegExp ][] = [
         [ TokenType.Comment, /^((?:\/\/[^\n]*\n?)|(?:\/[^\n]*$|\/(?!\\)\*[\s\S]*?\*(?!\\)\/))/ ],
         [ TokenType.String, /^(("(?:[^"\\]|\\.)*")|('(?:[^'\\]|\\.)*'))/ ],
         [ TokenType.TemplateLiteral, /^`(?:(?!\$\{)[^`\\]|\\.)*`/ ],
@@ -90,114 +90,61 @@ export class TokenDecoder {
         [ TokenType.Unknown, /^./ ],
     ];
 
-    static #templateLiteralRegExps: [ TokenType, RegExp ][] = [
+    const templateLiteralRegExps: [ TokenType, RegExp ][] = [
         [ TokenType.TemplateLiteralMiddle, /^\}(?:(?!\$\{)[^`\\]|\\.)*\$\{/ ],
         [ TokenType.TemplateLiteralEnd, /^\}(?:(?!\$\{)[^`\\]|\\.)*`/ ],
-        ...TokenDecoder.#defaultRegExps,
+        ...defaultRegExps,
     ];
 
-    static #regExpsTransition = new Map<TokenType, [ TokenType, RegExp ][]>([
-        [ TokenType.TemplateLiteralStart, this.#templateLiteralRegExps ],
-        [ TokenType.TemplateLiteralMiddle, this.#templateLiteralRegExps ],
-        [ TokenType.TemplateLiteralEnd, this.#defaultRegExps ],
+    const regExpsTransition = new Map<TokenType, [ TokenType, RegExp ][]>([
+        [ TokenType.TemplateLiteralStart, templateLiteralRegExps ],
+        [ TokenType.TemplateLiteralMiddle, templateLiteralRegExps ],
+        [ TokenType.TemplateLiteralEnd, defaultRegExps ],
     ]);
 
-    #activeRegExps: [ TokenType, RegExp ][];
+    let activeRegExps = defaultRegExps;
+    let position = 0;
+    let column = 0;
+    let line = 0;
 
-    position = 0;
-    column = 0;
-    line = 0;
+    outerLoop:
+        for (let index = 0; index < sourceCode.length;) {
+            const sourceCodeView = sourceCode.substring(index);
+            const begin = new Cursor(position, column, line);
 
-    constructor() {
-        this.#activeRegExps = TokenDecoder.#defaultRegExps;
-    }
+            for (const [ type, regExp ] of activeRegExps) {
+                const result = regExp.exec(sourceCodeView);
 
-    * decode(sourceCode: string, options: TokenDecoderOptions) {
-        outerLoop:
-            for (let index = 0; index < sourceCode.length;) {
-                const sourceCodeView = sourceCode.substring(index);
-                const begin = new Cursor(this.position, this.column, this.line);
+                if (result) {
+                    const payload = result[0];
 
-                for (const [ type, regExp ] of this.#activeRegExps) {
-                    const result = regExp.exec(sourceCodeView);
-
-                    if (result) {
-                        const payload = result[0];
-
-                        for (const character of payload) {
-                            if (character === "\n") {
-                                this.column = 0;
-                                this.line += 1;
-                            } else {
-                                this.column += 1;
-                            }
-
-                            index += 1;
+                    for (const character of payload) {
+                        if (character === "\n") {
+                            column = 0;
+                            line += 1;
+                        } else {
+                            column += 1;
                         }
 
-                        this.position += payload.length;
-
-                        const end = new Cursor(this.position, this.column, this.line);
-                        const span = new Span(options.sourceUrl, begin, end);
-
-                        yield new Token(type, payload, span);
-
-                        this.#activeRegExps = (
-                            TokenDecoder.#regExpsTransition.get(type) ??
-                            this.#activeRegExps
-                        );
-
-                        continue outerLoop;
+                        index += 1;
                     }
-                }
 
-                throw new Error(`${options.sourceUrl}:${begin.line}:${begin.column} unexpected character: ${JSON.stringify(sourceCode[index])}`);
+                    position += payload.length;
+
+                    const end = new Cursor(position, column, line);
+                    const span = new Span(sourceUrl, begin, end);
+
+                    yield new Token(type, payload, span);
+
+                    activeRegExps = (
+                        regExpsTransition.get(type) ??
+                        activeRegExps
+                    );
+
+                    continue outerLoop;
+                }
             }
-    }
-}
 
-export class TokenDecoderStream extends TransformStream<Uint8Array, Token> {
-    static #regExp = /^(?<sourceCode>(?:(?:(?!(?:\r?\n|\u2028|\u2029)).)*(?:\r?\n|\u2028|\u2029))+)(?<restBuffer>.*(\r?\n|\u2028|\u2029)?)$/usm;
-
-    readonly #textDecoder = new TextDecoder();
-    readonly #tokenDecoder = new TokenDecoder();
-
-    constructor(
-        readonly sourceUrl: URL,
-        writableStrategy?: QueuingStrategy<Uint8Array>,
-        readableStrategy?: QueuingStrategy<Token>,
-    ) {
-        let buffer = "";
-
-        const tokenDecoderOptions: TokenDecoderOptions = {sourceUrl, stream: true};
-        const transformer: Transformer<Uint8Array, Token> = {
-            transform: (chunk, controller) => {
-                const match: RegExpMatchArray | null = (
-                    TokenDecoderStream.#regExp
-                        .exec(buffer += (
-                            this.#textDecoder.decode(chunk, {
-                                stream: true,
-                            })
-                        ))
-                );
-
-                if (match?.groups) {
-                    const {sourceCode, restBuffer} = match.groups;
-
-                    for (const token of this.#tokenDecoder.decode(sourceCode, tokenDecoderOptions)) {
-                        controller.enqueue(token);
-                    }
-
-                    buffer = restBuffer;
-                }
-            },
-            flush: (controller) => {
-                for (const token of this.#tokenDecoder.decode(buffer, tokenDecoderOptions)) {
-                    controller.enqueue(token);
-                }
-            },
-        };
-
-        super(transformer, writableStrategy, readableStrategy);
-    }
+            throw new Error(`${sourceUrl}:${begin.line}:${begin.column} unexpected character: ${JSON.stringify(sourceCode[index])}`);
+        }
 }
