@@ -1,8 +1,15 @@
-import { tokenize } from "./compiler/lexical_analysis.ts";
+import { TokenDecoderStream } from "./compiler/lexical_analysis.ts";
 
 console.time();
 
-for await (const token of tokenize(new URL("./main.ts", import.meta.url))) {
+const sourceUrl = new URL(/*"../samples/hello_world.js", */import.meta.url);
+
+for await (const token of await fetch(sourceUrl)
+    .then(response =>
+        (response.body ?? ReadableStream.from([]))
+            .pipeThrough(new TokenDecoderStream(sourceUrl))
+    )) {
+
     console.log(token);
 }
 

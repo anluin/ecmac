@@ -51,30 +51,32 @@ export class Token {
     }
 }
 
-export function tokenize(source: string): AsyncGenerator<Token>;
-export function tokenize(source: `${'/' | './'}${string}`): AsyncGenerator<Token>;
-export function tokenize(source: `${"file" | "http" | "https"}://${string}` | URL): AsyncGenerator<Token>;
-export async function* tokenize(source: string | URL) {
-    const
-        sourceUrl = (
-            source instanceof URL
-                ? source
-                : /^\.?\//m.test(source)
-                    ? toFileUrl(resolve(source))
-                    : /^(file|https?):\/{2}/m.test(source)
-                        ? new URL(source)
-                        : new URL(
-                            `data:application/javascript;base64,${
-                                encodeBase64Url(source)
-                            }`,
-                        )
-        ),
-        sourceCode = await (
-            fetch(sourceUrl)
-                .then(response => response.text())
-        );
+export function resolveSource(source: string | URL): URL;
+export function resolveSource(source: `${'/' | './'}${string}`): URL;
+export function resolveSource(source: `${"file" | "http" | "https"}://${string}` | URL): URL;
+export function resolveSource(source: string | URL) {
+    return (
+        source instanceof URL
+            ? source
+            : /^\.?\//m.test(source)
+                ? toFileUrl(resolve(source))
+                : /^(file|https?):\/{2}/m.test(source)
+                    ? new URL(source)
+                    : new URL(
+                        `data:application/javascript;base64,${
+                            encodeBase64Url(source)
+                        }`,
+                    )
+    )
+}
 
-    const defaultRegExps: [ TokenType, RegExp ][] = [
+export type TokenDecoderOptions = {
+    sourceUrl: URL,
+    stream?: boolean,
+};
+
+export class TokenDecoder {
+    static #defaultRegExps: [ TokenType, RegExp ][] = [
         [ TokenType.Comment, /^((?:\/\/[^\n]*\n?)|(?:\/[^\n]*$|\/(?!\\)\*[\s\S]*?\*(?!\\)\/))/ ],
         [ TokenType.String, /^(("(?:[^"\\]|\\.)*")|('(?:[^'\\]|\\.)*'))/ ],
         [ TokenType.TemplateLiteral, /^`(?:(?!\$\{)[^`\\]|\\.)*`/ ],
@@ -88,59 +90,114 @@ export async function* tokenize(source: string | URL) {
         [ TokenType.Unknown, /^./ ],
     ];
 
-    const templateLiteralRegExps: [ TokenType, RegExp ][] = [
+    static #templateLiteralRegExps: [ TokenType, RegExp ][] = [
         [ TokenType.TemplateLiteralMiddle, /^\}(?:(?!\$\{)[^`\\]|\\.)*\$\{/ ],
         [ TokenType.TemplateLiteralEnd, /^\}(?:(?!\$\{)[^`\\]|\\.)*`/ ],
-        ...defaultRegExps,
+        ...TokenDecoder.#defaultRegExps,
     ];
 
-    const regExpsTransition = new Map<TokenType, [ TokenType, RegExp ][]>([
-        [ TokenType.TemplateLiteralStart, templateLiteralRegExps ],
-        [ TokenType.TemplateLiteralMiddle, templateLiteralRegExps ],
-        [ TokenType.TemplateLiteralEnd, defaultRegExps ],
+    static #regExpsTransition = new Map<TokenType, [ TokenType, RegExp ][]>([
+        [ TokenType.TemplateLiteralStart, this.#templateLiteralRegExps ],
+        [ TokenType.TemplateLiteralMiddle, this.#templateLiteralRegExps ],
+        [ TokenType.TemplateLiteralEnd, this.#defaultRegExps ],
     ]);
 
-    let activeRegExps: [ TokenType, RegExp ][] = defaultRegExps;
+    #activeRegExps: [ TokenType, RegExp ][];
 
-    outerLoop:
-        for (
-            let
-                position = 0,
-                column = 0,
-                line = 0;
-            position < sourceCode.length;
-        ) {
-            const sourceCodeView = sourceCode.substring(position);
-            const begin = new Cursor(position, column, line);
+    position = 0;
+    column = 0;
+    line = 0;
 
-            for (const [ type, regExp ] of activeRegExps) {
-                const result = regExp.exec(sourceCodeView);
+    constructor() {
+        this.#activeRegExps = TokenDecoder.#defaultRegExps;
+    }
 
-                if (result) {
-                    const payload = result[0];
+    * decode(sourceCode: string, options: TokenDecoderOptions) {
+        outerLoop:
+            for (let index = 0; index < sourceCode.length;) {
+                const sourceCodeView = sourceCode.substring(index);
+                const begin = new Cursor(this.position, this.column, this.line);
 
-                    for (const character of payload) {
-                        if (character !== "\n") {
-                            column += 1;
-                        } else {
-                            column = 0;
-                            line += 1;
+                for (const [ type, regExp ] of this.#activeRegExps) {
+                    const result = regExp.exec(sourceCodeView);
+
+                    if (result) {
+                        const payload = result[0];
+
+                        for (const character of payload) {
+                            if (character === "\n") {
+                                this.column = 0;
+                                this.line += 1;
+                            } else {
+                                this.column += 1;
+                            }
+
+                            index += 1;
                         }
+
+                        this.position += payload.length;
+
+                        const end = new Cursor(this.position, this.column, this.line);
+                        const span = new Span(options.sourceUrl, begin, end);
+
+                        yield new Token(type, payload, span);
+
+                        this.#activeRegExps = (
+                            TokenDecoder.#regExpsTransition.get(type) ??
+                            this.#activeRegExps
+                        );
+
+                        continue outerLoop;
+                    }
+                }
+
+                throw new Error(`${options.sourceUrl}:${begin.line}:${begin.column} unexpected character: ${JSON.stringify(sourceCode[index])}`);
+            }
+    }
+}
+
+export class TokenDecoderStream extends TransformStream<Uint8Array, Token> {
+    static #regExp = /^(?<sourceCode>(?:(?:(?!(?:\r?\n|\u2028|\u2029)).)*(?:\r?\n|\u2028|\u2029))+)(?<restBuffer>.*(\r?\n|\u2028|\u2029)?)$/usm;
+
+    readonly #textDecoder = new TextDecoder();
+    readonly #tokenDecoder = new TokenDecoder();
+
+    constructor(
+        readonly sourceUrl: URL,
+        writableStrategy?: QueuingStrategy<Uint8Array>,
+        readableStrategy?: QueuingStrategy<Token>,
+    ) {
+        let buffer = "";
+
+        const tokenDecoderOptions: TokenDecoderOptions = {sourceUrl, stream: true};
+        const transformer: Transformer<Uint8Array, Token> = {
+            transform: (chunk, controller) => {
+                const match: RegExpMatchArray | null = (
+                    TokenDecoderStream.#regExp
+                        .exec(buffer += (
+                            this.#textDecoder.decode(chunk, {
+                                stream: true,
+                            })
+                        ))
+                );
+
+                if (match?.groups) {
+                    const {sourceCode, restBuffer} = match.groups;
+
+                    for (const token of this.#tokenDecoder.decode(sourceCode, tokenDecoderOptions)) {
+                        controller.enqueue(token);
                     }
 
-                    position += payload.length;
-
-                    const end = new Cursor(position, column, line);
-                    const span = new Span(sourceUrl, begin, end);
-
-                    yield new Token(type, payload, span);
-
-                    activeRegExps = regExpsTransition.get(type) ?? activeRegExps;
-
-                    continue outerLoop;
+                    buffer = restBuffer;
                 }
-            }
+            },
+            flush: (controller) => {
+                for (const token of this.#tokenDecoder.decode(buffer, tokenDecoderOptions)) {
+                    controller.enqueue(token);
+                }
+            },
+        };
 
-            throw new Error(`${sourceUrl}:${begin.line}:${begin.column} unexpected character: ${JSON.stringify(sourceCode[position])}`);
-        }
+        super(transformer, writableStrategy, readableStrategy);
+    }
 }
