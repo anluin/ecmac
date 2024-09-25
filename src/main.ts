@@ -1,11 +1,13 @@
+import { tokenizer } from "./compiler/languages/ecmascript.ts";
 import { tokenize } from "./compiler/lexical_analysis.ts";
+
 
 console.time();
 
-const sourceUrl = new URL("../samples/hello_world.js", import.meta.url);
-
-for await (const token of tokenize(sourceUrl)) {
-
+for await (const token of tokenize({
+    sourceUrl: new URL("../samples/hello_world.js", import.meta.url),
+    tokenizer,
+})) {
     console.log(token);
 }
 

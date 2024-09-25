@@ -1,4 +1,4 @@
-// deno-lint-ignore-file no-control-regex
+// noinspection JSUnusedGlobalSymbols
 
 import { encodeBase64Url } from "@std/encoding";
 import { resolve, toFileUrl } from "@std/path";
@@ -22,32 +22,83 @@ export class Span {
     }
 }
 
-export enum TokenType {
-    Unknown,
-    Identifier,
-    Number,
-    Punctuator,
-    String,
-    RegExp,
-    Comment,
-    LineTerminator,
-    Whitespace,
-    TemplateLiteral,
-    TemplateLiteralStart,
-    TemplateLiteralMiddle,
-    TemplateLiteralEnd,
+export const enum TokenKind {
+    End = 1 << 1,
+    Integer = 1 << 2,
+    Float = 1 << 3,
+    String = 1 << 4,
+    Number = TokenKind.Integer | TokenKind.Float,
+    Literal = TokenKind.Number | TokenKind.String,
+    Whitespace = 1 << 5,
+    Punctuator = 1 << 6,
+    Identifier = 1 << 7,
+    LineComment = 1 << 8,
+    BlockComment = 1 << 9,
+    Comment = TokenKind.LineComment | TokenKind.BlockComment,
+    Template = 1 << 10,
+    TemplateHead = 1 << 11,
+    TemplateMiddle = 1 << 12,
+    TemplateTail = 1 << 13,
+    RegExp = 1 << 14,
+    LineTerminator = 1 << 15,
+    Unknown = 1 << 16,
 }
 
-export class Token {
+export const stringifyTokenKind = (kind: TokenKind) => {
+    switch (kind) {
+        case TokenKind.End:
+            return "End";
+        case TokenKind.Integer:
+            return "Integer";
+        case TokenKind.Float:
+            return "Float";
+        case TokenKind.String:
+            return "String";
+        case TokenKind.Number:
+            return "Number";
+        case TokenKind.Literal:
+            return "Literal";
+        case TokenKind.Whitespace:
+            return "Whitespace";
+        case TokenKind.Punctuator:
+            return "Punctuator";
+        case TokenKind.Identifier:
+            return "Identifier";
+        case TokenKind.LineComment:
+            return "LineComment";
+        case TokenKind.BlockComment:
+            return "BlockComment";
+        case TokenKind.Comment:
+            return "Comment";
+        case TokenKind.Template:
+            return "Template";
+        case TokenKind.TemplateHead:
+            return "TemplateHead";
+        case TokenKind.TemplateMiddle:
+            return "TemplateMiddle";
+        case TokenKind.TemplateTail:
+            return "TemplateTail";
+        case TokenKind.RegExp:
+            return "RegExp";
+        case TokenKind.LineTerminator:
+            return "LineTerminator";
+        case TokenKind.Unknown:
+            return "Unknown";
+        default:
+            throw new Error("Invalid TokenKind");
+    }
+}
+
+export class Token<Payload extends string = string> {
     constructor(
-        readonly type: TokenType,
-        readonly payload: string,
+        readonly kind: TokenKind,
+        readonly payload: Payload,
         readonly span: Span,
     ) {
     }
 
     [Symbol.for("Deno.customInspect")]() {
-        return `${this.span.sourceUrl.href}:${this.span.begin.line + 1}:${this.span.begin.column + 1}: ${JSON.stringify(this.payload)} (${TokenType[this.type]})`;
+        return `${this.span.sourceUrl.href}:${this.span.begin.line + 1}:${this.span.begin.column + 1}: ${JSON.stringify(this.payload)} (${stringifyTokenKind(this.kind)})`;
     }
 }
 
@@ -70,81 +121,194 @@ export function resolveSourceUrl(source: string | URL) {
     )
 }
 
-export async function* tokenize(sourceUrl: URL) {
-    const sourceCode = await (
-        fetch(sourceUrl)
-            .then(response => response.text())
-    );
+export type Character = string | null;
 
-    const defaultRegExps: [ TokenType, RegExp ][] = [
-        [ TokenType.Comment, /^((?:\/\/[^\n]*\n?)|(?:\/[^\n]*$|\/(?!\\)\*[\s\S]*?\*(?!\\)\/))/ ],
-        [ TokenType.String, /^(("(?:[^"\\]|\\.)*")|('(?:[^'\\]|\\.)*'))/ ],
-        [ TokenType.TemplateLiteral, /^`(?:(?!\$\{)[^`\\]|\\.)*`/ ],
-        [ TokenType.TemplateLiteralStart, /^`(?:(?!\$\{)[^`\\]|\\.)*\$\{/ ],
-        [ TokenType.Number, /^(0|(?:[1-9][0-9]*))/ ],
-        [ TokenType.RegExp, /^(\/(?:(?:\[\^[^\]]+\])|(?:[^\/\\])|\\.)*\/[a-z]*)/ ],
-        [ TokenType.Identifier, /^([_$\p{L}][_$\p{L}\p{M}\p{N}\p{Pc}]*)/u ],
-        [ TokenType.Punctuator, /^(\/=?|={1,3}|!(?:==?)?|%=?|&[&=]?|\*=?|\+[+=]?|-[-=]?|<{1,2}=?|>{1,3}=?|\^=?|\|[|=]?|[(),.;:[\]{}~]|\?(\?=?)?)/ ],
-        [ TokenType.Whitespace, /^([\u0009\u000B\u000C\u0020\u00A0\uFEFF]+)/u ],
-        [ TokenType.LineTerminator, /^(\r?\n|\u2028|\u2029)/u ],
-        [ TokenType.Unknown, /^./ ],
-    ];
+export const enum Command {
+    Peek,
+    Consume,
+}
 
-    const templateLiteralRegExps: [ TokenType, RegExp ][] = [
-        [ TokenType.TemplateLiteralMiddle, /^\}(?:(?!\$\{)[^`\\]|\\.)*\$\{/ ],
-        [ TokenType.TemplateLiteralEnd, /^\}(?:(?!\$\{)[^`\\]|\\.)*`/ ],
-        ...defaultRegExps,
-    ];
+export type TokenDecoderGenerator<T> = Generator<Command, T, Character>;
+export type Tokenizer = (initialCharacter: Character) => TokenDecoderGenerator<TokenKind>;
+export type TokenizerComponent = { (initialCharacter: Character): TokenDecoderGenerator<boolean> };
 
-    const regExpsTransition = new Map<TokenType, [ TokenType, RegExp ][]>([
-        [ TokenType.TemplateLiteralStart, templateLiteralRegExps ],
-        [ TokenType.TemplateLiteralMiddle, templateLiteralRegExps ],
-        [ TokenType.TemplateLiteralEnd, defaultRegExps ],
-    ]);
+export function manyOf(part: (character: Character) => boolean): TokenizerComponent;
+export function manyOf(start: (character: Character) => boolean, part: (character: Character) => boolean): TokenizerComponent;
+export function manyOf(partOrStart: (character: Character) => boolean, optionalPart?: (character: Character) => boolean): TokenizerComponent {
+    return function* (initialCharacter) {
+        if (partOrStart(initialCharacter)) {
+            do {
+                yield Command.Consume;
+            } while ((optionalPart ?? partOrStart)(yield Command.Peek))
 
-    let activeRegExps = defaultRegExps;
-    let position = 0;
-    let column = 0;
-    let line = 0;
+            return true;
+        }
 
-    outerLoop:
-        for (let index = 0; index < sourceCode.length;) {
-            const sourceCodeView = sourceCode.substring(index);
-            const begin = new Cursor(position, column, line);
+        return false;
+    };
+}
 
-            for (const [ type, regExp ] of activeRegExps) {
-                const result = regExp.exec(sourceCodeView);
+export function string(indicator: string, isLineTerminator: (character: Character) => boolean): TokenizerComponent {
+    return function* (initialCharacter) {
+        if (initialCharacter === indicator) {
+            yield Command.Consume;
 
-                if (result) {
-                    const payload = result[0];
+            for (; ;) {
+                const character = yield Command.Peek;
 
-                    for (const character of payload) {
-                        if (character === "\n") {
-                            column = 0;
-                            line += 1;
-                        } else {
-                            column += 1;
-                        }
+                if (isLineTerminator(character)) {
+                    throw new Error("Unclosed string literal");
+                }
 
-                        index += 1;
-                    }
+                yield Command.Consume;
 
-                    position += payload.length;
-
-                    const end = new Cursor(position, column, line);
-                    const span = new Span(sourceUrl, begin, end);
-
-                    yield new Token(type, payload, span);
-
-                    activeRegExps = (
-                        regExpsTransition.get(type) ??
-                        activeRegExps
-                    );
-
-                    continue outerLoop;
+                if (character === indicator) {
+                    break;
                 }
             }
 
-            throw new Error(`${sourceUrl}:${begin.line}:${begin.column} unexpected character: ${JSON.stringify(sourceCode[index])}`);
+            return true;
         }
+
+        return false;
+    };
+}
+
+export type TokenDecoderOptions = {
+    tokenizer: Tokenizer,
+    sourceUrl: URL,
+};
+
+export type TokenDecoderDecodeOptions = {
+    stream?: boolean,
+};
+
+export class TokenDecoder {
+    readonly #generatorFunction: Tokenizer;
+    readonly sourceUrl: URL;
+
+    #position = 0;
+    #column = 0;
+    #line = 0;
+
+    #state?: {
+        generator: TokenDecoderGenerator<TokenKind>,
+        result: IteratorResult<Command>,
+        begin: Cursor,
+        payload: string,
+    };
+
+    constructor(options: TokenDecoderOptions) {
+        this.#generatorFunction = options.tokenizer;
+        this.sourceUrl = options.sourceUrl;
+    }
+
+    * decode(sourceCode: string, options?: TokenDecoderDecodeOptions) {
+        const length = sourceCode.length + +(options?.stream !== true);
+
+        for (let index = 0; index < length; index++) {
+            const character = sourceCode[index] ?? null;
+
+            let command = Command.Peek;
+
+            while (command === Command.Peek) {
+                if (!this.#state) {
+                    const generator = this.#generatorFunction(character);
+                    const begin = new Cursor(this.#position, this.#column, this.#line);
+                    const result = generator.next();
+                    const payload = "";
+
+                    this.#state = {
+                        generator,
+                        payload,
+                        result,
+                        begin,
+                    };
+                }
+
+                if (this.#state.result.done) {
+                    yield new Token(
+                        this.#state.result.value,
+                        this.#state.payload,
+                        new Span(
+                            this.sourceUrl,
+                            this.#state.begin,
+                            new Cursor(
+                                this.#position,
+                                this.#column,
+                                this.#line,
+                            ),
+                        ),
+                    );
+
+                    this.#state = undefined;
+                } else {
+                    command = this.#state.result.value;
+
+                    if (command === Command.Consume) {
+                        this.#state.payload += character;
+                    }
+
+                    this.#state.result = this.#state.generator.next(character);
+                }
+            }
+
+            if (character !== "\n") {
+                this.#column += 1;
+            } else {
+                this.#column = 0;
+                this.#line += 1;
+            }
+
+            this.#position += 1;
+        }
+
+        if (options?.stream === true) {
+            this.#position = 0;
+            this.#column = 0;
+            this.#line = 0;
+        }
+    }
+
+    * flush() {
+        yield* this.decode("");
+    }
+}
+
+export class TokenDecoderStream extends TransformStream<string, Token[]> {
+    constructor(
+        options: TokenDecoderOptions,
+        writableStrategy?: QueuingStrategy<string>,
+        readableStrategy?: QueuingStrategy<Token[]>,
+    ) {
+        const tokenDecoder = new TokenDecoder(options);
+
+        super(
+            <Transformer<string, Token[]>>{
+                transform: (chunk, controller) => {
+                    controller.enqueue([ ...tokenDecoder.decode(chunk, {
+                        stream: true,
+                    }) ]);
+                },
+                flush: (controller) => {
+                    controller.enqueue([ ...tokenDecoder.flush() ]);
+                },
+            },
+            writableStrategy,
+            readableStrategy,
+        );
+    }
+}
+
+export async function* tokenize(options: TokenDecoderOptions) {
+    for await (const chunk of await (
+        fetch(options.sourceUrl)
+            .then(response => (
+                (response.body ?? ReadableStream.from([]))
+                    .pipeThrough(new TextDecoderStream())
+                    .pipeThrough(new TokenDecoderStream(options))
+            ))
+    )) {
+        yield* chunk;
+    }
 }
