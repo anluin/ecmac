@@ -128,63 +128,62 @@ export const enum Command {
     Consume,
 }
 
-export type TokenDecoderGenerator<T> = Generator<Command, T, Character>;
-export type Tokenizer = (initialCharacter: Character) => TokenDecoderGenerator<TokenKind>;
-export type TokenizerComponent = { (initialCharacter: Character): TokenDecoderGenerator<boolean> };
+export type TokenParserGenerator<T> = Generator<Command, T, Character>;
+export type TokenizerFn = (initialCharacter: Character) => TokenParserGenerator<TokenKind>;
+export type TokenizerFnComponent<T = boolean> = { (initialCharacter: Character): TokenParserGenerator<T> };
 
-export function manyOf(part: (character: Character) => boolean): TokenizerComponent;
-export function manyOf(start: (character: Character) => boolean, part: (character: Character) => boolean): TokenizerComponent;
-export function manyOf(partOrStart: (character: Character) => boolean, optionalPart?: (character: Character) => boolean): TokenizerComponent {
-    return function* (initialCharacter) {
-        if (partOrStart(initialCharacter)) {
-            do {
-                yield Command.Consume;
-            } while ((optionalPart ?? partOrStart)(yield Command.Peek))
+export const utils = {
+    manyOf<T extends TokenKind | void = void>(partOrStart: (character: Character) => boolean, optionalPart?: (character: Character) => boolean, tokenKind?: T) {
+        return function* (initialCharacter) {
+            if (partOrStart(initialCharacter)) {
+                do {
+                    yield Command.Consume;
+                } while ((optionalPart ?? partOrStart)(yield Command.Peek))
 
-            return true;
-        }
-
-        return false;
-    };
-}
-
-export function string(indicator: string, isLineTerminator: (character: Character) => boolean): TokenizerComponent {
-    return function* (initialCharacter) {
-        if (initialCharacter === indicator) {
-            yield Command.Consume;
-
-            for (; ;) {
-                const character = yield Command.Peek;
-
-                if (isLineTerminator(character)) {
-                    throw new Error("Unclosed string literal");
-                }
-
-                yield Command.Consume;
-
-                if (character === indicator) {
-                    break;
-                }
+                return tokenKind ?? true;
             }
 
-            return true;
-        }
+            return tokenKind ?? false;
+        } as TokenizerFnComponent<T extends TokenKind ? TokenKind : boolean>;
+    },
+    string(indicator: string, isLineTerminator: (character: Character) => boolean): TokenizerFnComponent {
+        return function* (initialCharacter) {
+            if (initialCharacter === indicator) {
+                yield Command.Consume;
 
-        return false;
-    };
-}
+                for (; ;) {
+                    const character = yield Command.Peek;
 
-export type TokenDecoderOptions = {
-    tokenizer: Tokenizer,
+                    if (isLineTerminator(character)) {
+                        throw new Error("Unclosed string literal");
+                    }
+
+                    yield Command.Consume;
+
+                    if (character === indicator) {
+                        break;
+                    }
+                }
+
+                return true;
+            }
+
+            return false;
+        };
+    },
+} as const;
+
+export type TokenParserOptions = {
+    tokenizer: TokenizerFn,
     sourceUrl: URL,
 };
 
-export type TokenDecoderDecodeOptions = {
+export type TokenParserParseOptions = {
     stream?: boolean,
 };
 
-export class TokenDecoder {
-    readonly #generatorFunction: Tokenizer;
+export class TokenParser {
+    readonly #generatorFunction: TokenizerFn;
     readonly sourceUrl: URL;
 
     #position = 0;
@@ -192,18 +191,18 @@ export class TokenDecoder {
     #line = 0;
 
     #state?: {
-        generator: TokenDecoderGenerator<TokenKind>,
+        generator: TokenParserGenerator<TokenKind>,
         result: IteratorResult<Command>,
         begin: Cursor,
         payload: string,
     };
 
-    constructor(options: TokenDecoderOptions) {
+    constructor(options: TokenParserOptions) {
         this.#generatorFunction = options.tokenizer;
         this.sourceUrl = options.sourceUrl;
     }
 
-    * decode(sourceCode: string, options?: TokenDecoderDecodeOptions) {
+    * parse(sourceCode: string, options?: TokenParserParseOptions) {
         const length = sourceCode.length + +(options?.stream !== true);
 
         for (let index = 0; index < length; index++) {
@@ -211,7 +210,11 @@ export class TokenDecoder {
 
             let command = Command.Peek;
 
-            while (command === Command.Peek) {
+            while (command !== Command.Consume) {
+                if (character === null && !this.#state) {
+                    break;
+                }
+
                 if (!this.#state) {
                     const generator = this.#generatorFunction(character);
                     const begin = new Cursor(this.#position, this.#column, this.#line);
@@ -269,30 +272,40 @@ export class TokenDecoder {
             this.#line = 0;
         }
     }
-
-    * flush() {
-        yield* this.decode("");
-    }
 }
 
-export class TokenDecoderStream extends TransformStream<string, Token[]> {
+export class TokenParserStream extends TransformStream<string, Token[]> {
     constructor(
-        options: TokenDecoderOptions,
+        options: TokenParserOptions,
         writableStrategy?: QueuingStrategy<string>,
         readableStrategy?: QueuingStrategy<Token[]>,
     ) {
-        const tokenDecoder = new TokenDecoder(options);
+        const process = ((
+            tokenParser = new TokenParser(options),
+            previousString?: string
+        ) => (
+            (controller: TransformStreamDefaultController<Token[]>, string?: string) => {
+                if (previousString) {
+                    const options = {stream: string !== undefined};
+                    const tokens = Array.from(
+                        tokenParser.parse(previousString, options),
+                    );
+
+                    if (tokens.length > 0) {
+                        controller.enqueue(tokens);
+                    }
+                }
+
+                previousString = string;
+            }
+        ))();
 
         super(
             <Transformer<string, Token[]>>{
-                transform: (chunk, controller) => {
-                    controller.enqueue([ ...tokenDecoder.decode(chunk, {
-                        stream: true,
-                    }) ]);
-                },
-                flush: (controller) => {
-                    controller.enqueue([ ...tokenDecoder.flush() ]);
-                },
+                transform: (chunk, controller) =>
+                    process(controller, chunk),
+                flush: (controller) =>
+                    process(controller),
             },
             writableStrategy,
             readableStrategy,
@@ -300,13 +313,13 @@ export class TokenDecoderStream extends TransformStream<string, Token[]> {
     }
 }
 
-export async function* tokenize(options: TokenDecoderOptions) {
+export async function* tokenize(options: TokenParserOptions) {
     for await (const chunk of await (
         fetch(options.sourceUrl)
             .then(response => (
                 (response.body ?? ReadableStream.from([]))
                     .pipeThrough(new TextDecoderStream())
-                    .pipeThrough(new TokenDecoderStream(options))
+                    .pipeThrough(new TokenParserStream(options))
             ))
     )) {
         yield* chunk;
