@@ -1,22 +1,20 @@
-import { Statement, tokenizer } from "./compiler/languages/ecmascript/mod.ts";
-import { SyntaxParserStream } from "./compiler/syntax_analysis.ts";
-import { TokenParserStream } from "./compiler/lexical_analysis.ts";
+import { StatementNode } from "./compiler/languages/ecmascript/syntax_tree.ts";
+import { Token } from "./compiler/languages/ecmascript/token.ts";
+import { CodePointsStream } from "./compiler/code_point.ts";
+import { ParserStream } from "./compiler/parser.ts";
 
 
-console.time();
+const source = new URL("../samples/hello_world.js", import.meta.url);
+const response = await fetch(source);
 
-const sourceUrl = new URL("../samples/hello_world.js", import.meta.url);
-
-for await (const statement of await (
-    fetch(sourceUrl)
-        .then((response) => (
-            (response.body ?? ReadableStream.from([]))
-                .pipeThrough(new TextDecoderStream())
-                .pipeThrough(new TokenParserStream({sourceUrl, tokenizer}))
-                .pipeThrough(new SyntaxParserStream({parseable: Statement}))
-        ))
-)) {
-    console.log(statement);
+if (response.body) {
+    for await (const statements of (
+        response.body
+            .pipeThrough(new TextDecoderStream())
+            .pipeThrough(new CodePointsStream(source))
+            .pipeThrough(new ParserStream(Token))
+            .pipeThrough(new ParserStream(StatementNode))
+    )) {
+        console.log(statements);
+    }
 }
-
-console.timeEnd();
